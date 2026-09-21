@@ -1085,7 +1085,7 @@ class smc:
             else:
                 direction[i] = direction[i - 1] if i > 0 else 0
 
-            if direction[i - 1] == 1:
+            if direction[i] == 1:
                 divisor = top - bottom
                 current_retracement[i] = round(
                     100 - (((_low[i] - bottom) / divisor) * 100) if divisor != 0 else 0, 1
