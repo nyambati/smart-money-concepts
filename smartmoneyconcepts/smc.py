@@ -512,7 +512,13 @@ class smc:
         highVolume = np.zeros(ohlc_len, dtype=np.float32)
         percentage = np.zeros(ohlc_len, dtype=np.float32)
         mitigated_index = np.zeros(ohlc_len, dtype=np.int32)
-        breaker = np.full(ohlc_len, False, dtype=bool)
+        # the two passes below index these by their own order block position,
+        # and a single candle can be picked by both (an outside bar can be the
+        # lowest low of one window and the highest high of another). Sharing the
+        # arrays let one pass's breaker flag invalidate the other's block, so
+        # each pass gets its own.
+        bullish_breaker = np.full(ohlc_len, False, dtype=bool)
+        bearish_breaker = np.full(ohlc_len, False, dtype=bool)
 
         # Precompute swing indices (assumed sorted)
         swing_high_indices = np.flatnonzero(swing_hl == 1)
@@ -524,7 +530,7 @@ class smc:
             close_index = i
             # Update existing bullish OB
             for idx in active_bullish.copy():
-                if breaker[idx]:
+                if bullish_breaker[idx]:
                     if _high[close_index] > top_arr[idx]:
                         # Reset this OB
                         ob[idx] = 0
@@ -539,8 +545,9 @@ class smc:
                 else:
                     if ((not close_mitigation and _low[close_index] < bottom_arr[idx])
                         or (close_mitigation and min(_open[close_index], _close[close_index]) < bottom_arr[idx])):
-                        breaker[idx] = True
-                        mitigated_index[idx] = close_index - 1
+                        bullish_breaker[idx] = True
+                        # the mitigating candle is this one, not the one before
+                        mitigated_index[idx] = close_index
 
             # Find last swing high index less than current candle (using binary search)
             pos = np.searchsorted(swing_high_indices, close_index)
@@ -591,7 +598,7 @@ class smc:
             close_index = i
             # Update existing bearish OB
             for idx in active_bearish.copy():
-                if breaker[idx]:
+                if bearish_breaker[idx]:
                     if _low[close_index] < bottom_arr[idx]:
                         ob[idx] = 0
                         top_arr[idx] = 0.0
@@ -605,7 +612,7 @@ class smc:
                 else:
                     if ((not close_mitigation and _high[close_index] > top_arr[idx])
                         or (close_mitigation and max(_open[close_index], _close[close_index]) > top_arr[idx])):
-                        breaker[idx] = True
+                        bearish_breaker[idx] = True
                         mitigated_index[idx] = close_index
 
             # Find last swing low index less than current candle
