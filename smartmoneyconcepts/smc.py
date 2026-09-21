@@ -155,7 +155,9 @@ class smc:
         )
 
     @classmethod
-    def swing_highs_lows(cls, ohlc: DataFrame, swing_length: int = 50) -> Series:
+    def swing_highs_lows(
+        cls, ohlc: DataFrame, swing_length: int = 50, causal: bool = False
+    ) -> Series:
         """
         Swing Highs and Lows
         A swing high is when the current high is the highest high out of the swing_length amount of candles before and after.
@@ -163,11 +165,19 @@ class smc:
 
         parameters:
         swing_length: int - the amount of candles to look back and forward to determine the swing high or low
+        causal: bool - if True the swing is detected from past candles only and
+            reported on the candle that confirms it, swing_length candles after
+            the extreme itself. The default centered window marks the swing on
+            the extreme, which that candle cannot yet know about, so backtests
+            reading HighLow at that position are using future information.
 
         returns:
         HighLow = 1 if swing high, -1 if swing low
         Level = the level of the swing high or low
         """
+
+        if causal:
+            return cls._causal_swing_highs_lows(ohlc, swing_length)
 
         swing_length *= 2
         # set the highs to 1 if the current high is the highest high in the last 5 candles and next 5 candles
@@ -230,6 +240,65 @@ class smc:
             np.where(swing_highs_lows == 1, ohlc["high"], ohlc["low"]),
             np.nan,
         )
+
+        return pd.concat(
+            [
+                pd.Series(swing_highs_lows, name="HighLow", index=ohlc.index),
+                pd.Series(level, name="Level", index=ohlc.index),
+            ],
+            axis=1,
+        )
+
+    @classmethod
+    def _causal_swing_highs_lows(cls, ohlc: DataFrame, swing_length: int) -> DataFrame:
+        """Swing detection that never reads a candle the report bar cannot see.
+
+        A candle is a swing high candidate when it is the highest of itself and
+        the swing_length candles before it, and the swing_length candles that
+        follow are all strictly lower. That confirmation is only complete
+        swing_length candles later, so the swing is reported there, carrying the
+        extreme's price in Level.
+        """
+        n = len(ohlc)
+        highs = ohlc["high"]
+        lows = ohlc["low"]
+
+        # the extreme compared with the window that precedes it
+        trailing_high = highs.rolling(swing_length + 1).max().values
+        trailing_low = lows.rolling(swing_length + 1).min().values
+
+        # the window that follows the extreme, read from the confirming candle
+        following_high = (
+            highs.rolling(swing_length).max().shift(-swing_length).values
+        )
+        following_low = lows.rolling(swing_length).min().shift(-swing_length).values
+
+        _high = highs.values
+        _low = lows.values
+
+        with np.errstate(invalid="ignore"):
+            is_high = (_high >= trailing_high) & (following_high < _high)
+            is_low = (_low <= trailing_low) & (following_low > _low)
+
+        swing_highs_lows = np.full(n, np.nan)
+        level = np.full(n, np.nan)
+
+        # a swing high and a swing low cannot share an extreme; break the tie
+        # the same way the centered detection does, with the high winning
+        candidates = np.flatnonzero(is_high | is_low)
+        last_direction = 0
+        for extreme in candidates:
+            report = extreme + swing_length
+            if report >= n:
+                break
+            direction = 1 if is_high[extreme] else -1
+            # keep the swings alternating without retracting anything already
+            # reported, which is what rewriting history would amount to
+            if direction == last_direction:
+                continue
+            swing_highs_lows[report] = direction
+            level[report] = _high[extreme] if direction == 1 else _low[extreme]
+            last_direction = direction
 
         return pd.concat(
             [
@@ -429,6 +498,9 @@ class smc:
         _close = ohlc["close"].values
         _volume = ohlc["volume"].values
         swing_hl = swing_highs_lows["HighLow"].values
+        # the swing's own price, which is not always the price of the candle the
+        # swing is reported on - a causal swing frame reports it later
+        swing_level = swing_highs_lows["Level"].values
 
         # Pre-allocate arrays
         crossed = np.full(ohlc_len, False, dtype=bool)
@@ -475,12 +547,15 @@ class smc:
             last_top_index = swing_high_indices[pos - 1] if pos > 0 else None
 
             if last_top_index is not None:
-                if _close[close_index] > _high[last_top_index] and not crossed[last_top_index]:
+                if (
+                    _close[close_index] > swing_level[last_top_index]
+                    and not crossed[last_top_index]
+                ):
                     crossed[last_top_index] = True
                     # Initialise with default values from previous candle
                     default_index = close_index - 1
-                    obBtm = _high[default_index]
-                    obTop = _low[default_index]
+                    obTop = _high[default_index]
+                    obBtm = _low[default_index]
                     obIndex = default_index
                     # Look for a lower low between last_top_index and current candle
                     if close_index - last_top_index > 1:
@@ -538,7 +613,10 @@ class smc:
             last_btm_index = swing_low_indices[pos - 1] if pos > 0 else None
 
             if last_btm_index is not None:
-                if _close[close_index] < _low[last_btm_index] and not crossed[last_btm_index]:
+                if (
+                    _close[close_index] < swing_level[last_btm_index]
+                    and not crossed[last_btm_index]
+                ):
                     crossed[last_btm_index] = True
                     default_index = close_index - 1
                     obTop = _high[default_index]

@@ -56,7 +56,7 @@ MitigatedIndex = the index of the candle that mitigated the fair value gap, NaN 
 ### Swing Highs and Lows
 
 ```python
-smc.swing_highs_lows(ohlc, swing_length = 50)
+smc.swing_highs_lows(ohlc, swing_length = 50, causal = False)
 ```
 
 A swing high is when the current high is the highest high out of the swing_length amount of candles before and after.
@@ -64,10 +64,33 @@ A swing low is when the current low is the lowest low out of the swing_length am
 
 parameters:<br>
 swing_length: int - the amount of candles to look back and forward to determine the swing high or low<br>
+causal: bool - detect swings from past candles only, see the note below<br>
 
 returns:<br>
 HighLow = 1 if swing high, -1 if swing low<br>
 Level = the level of the swing high or low<br>
+
+#### Look-ahead bias
+
+The default detection uses a window centered on the candle, so the swing marked at
+candle `i` is only knowable at candle `i + swing_length`. On the bundled EURUSD 15m
+data with `swing_length=5`, a swing marked at bar 1010 does not appear until the data
+runs through bar 1015. A backtest that reads `HighLow` at the bar it is marked on is
+therefore trading on information that bar did not have.
+
+Pass `causal=True` to detect swings from past candles only. A candle is a swing high
+when it is the highest of itself and the `swing_length` candles before it, and the
+`swing_length` candles that follow are all lower. That confirmation completes
+`swing_length` candles later, so the swing is reported there, with `Level` carrying the
+extreme's price rather than the reporting candle's. Nothing already reported is ever
+revised, which also keeps the order blocks built on top of it from being retracted:
+
+```python
+swings = smc.swing_highs_lows(ohlc, swing_length=5, causal=True)
+order_blocks = smc.ob(ohlc, swings)
+```
+
+The default stays `causal=False` so existing results do not move.
 
 ### Break of Structure (BOS) & Change of Character (CHoCH)
 
