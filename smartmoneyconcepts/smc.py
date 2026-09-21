@@ -1,4 +1,5 @@
 from functools import wraps
+import re
 import pandas as pd
 import numpy as np
 from pandas import DataFrame, Series
@@ -48,9 +49,24 @@ def apply(decorator):
     return decorate
 
 
+def _resolve_time_zone(time_zone: str) -> str:
+    """Turn a "UTC+5" / "GMT-3" style offset into a zone pandas understands.
+
+    The POSIX "Etc/GMT" zones invert the sign - Etc/GMT+5 is UTC-5 - so a naive
+    string replace applied the offset backwards. Anything that is not a fixed
+    offset (an IANA name) is passed through untouched.
+    """
+    match = re.fullmatch(r"(?:UTC|GMT)([+-])(\d{1,2})(?::00)?", time_zone.strip())
+    if match is None:
+        return time_zone
+    sign, hours = match.group(1), int(match.group(2))
+    # flip the sign to compensate for the POSIX convention
+    return "Etc/GMT{}{}".format("-" if sign == "+" else "+", hours)
+
+
 @apply(inputvalidator(input_="ohlc"))
 class smc:
-    __version__ = "0.0.27"
+    __version__ = "0.0.28"
 
     @classmethod
     def fvg(cls, ohlc: DataFrame, join_consecutive=False) -> Series:
@@ -110,25 +126,30 @@ class smc:
                     bottom[i + 1] = min(bottom[i], bottom[i + 1])
                     fvg[i] = top[i] = bottom[i] = np.nan
 
+        _low = ohlc["low"].values
+        _high = ohlc["high"].values
         mitigated_index = np.zeros(len(ohlc), dtype=np.int32)
         for i in np.where(~np.isnan(fvg))[0]:
             mask = np.zeros(len(ohlc), dtype=np.bool_)
             if fvg[i] == 1:
-                mask = ohlc["low"][i + 2 :] <= top[i]
+                mask = _low[i + 2 :] <= top[i]
             elif fvg[i] == -1:
-                mask = ohlc["high"][i + 2 :] >= bottom[i]
+                mask = _high[i + 2 :] >= bottom[i]
             if np.any(mask):
                 j = np.argmax(mask) + i + 2
                 mitigated_index[i] = j
 
+        # 0 means "never mitigated", which would otherwise be indistinguishable
+        # from "mitigated by the candle at position 0"
+        mitigated_index = np.where(mitigated_index != 0, mitigated_index, np.nan)
         mitigated_index = np.where(np.isnan(fvg), np.nan, mitigated_index)
 
         return pd.concat(
             [
-                pd.Series(fvg, name="FVG"),
-                pd.Series(top, name="Top"),
-                pd.Series(bottom, name="Bottom"),
-                pd.Series(mitigated_index, name="MitigatedIndex"),
+                pd.Series(fvg, name="FVG", index=ohlc.index),
+                pd.Series(top, name="Top", index=ohlc.index),
+                pd.Series(bottom, name="Bottom", index=ohlc.index),
+                pd.Series(mitigated_index, name="MitigatedIndex", index=ohlc.index),
             ],
             axis=1,
         )
@@ -212,8 +233,8 @@ class smc:
 
         return pd.concat(
             [
-                pd.Series(swing_highs_lows, name="HighLow"),
-                pd.Series(level, name="Level"),
+                pd.Series(swing_highs_lows, name="HighLow", index=ohlc.index),
+                pd.Series(level, name="Level", index=ohlc.index),
             ],
             axis=1,
         )
@@ -238,7 +259,8 @@ class smc:
         BrokenIndex = the index of the candle that broke the level
         """
 
-        swing_highs_lows = swing_highs_lows.copy()
+        swing_hl = swing_highs_lows["HighLow"].values
+        swing_level = swing_highs_lows["Level"].values
 
         level_order = []
         highs_lows_order = []
@@ -249,10 +271,10 @@ class smc:
 
         last_positions = []
 
-        for i in range(len(swing_highs_lows["HighLow"])):
-            if not np.isnan(swing_highs_lows["HighLow"][i]):
-                level_order.append(swing_highs_lows["Level"][i])
-                highs_lows_order.append(swing_highs_lows["HighLow"][i])
+        for i in range(len(swing_hl)):
+            if not np.isnan(swing_hl[i]):
+                level_order.append(swing_level[i])
+                highs_lows_order.append(swing_hl[i])
                 if len(level_order) >= 4:
                     # bullish bos
                     bos[last_positions[-2]] = (
@@ -337,10 +359,14 @@ class smc:
             mask = np.zeros(len(ohlc), dtype=np.bool_)
             # if the bos is 1 then check if the candles high has gone above the level
             if bos[i] == 1 or choch[i] == 1:
-                mask = ohlc["close" if close_break else "high"][i + 2 :] > level[i]
+                mask = (
+                    ohlc["close" if close_break else "high"].values[i + 2 :] > level[i]
+                )
             # if the bos is -1 then check if the candles low has gone below the level
             elif bos[i] == -1 or choch[i] == -1:
-                mask = ohlc["close" if close_break else "low"][i + 2 :] < level[i]
+                mask = (
+                    ohlc["close" if close_break else "low"].values[i + 2 :] < level[i]
+                )
             if np.any(mask):
                 j = np.argmax(mask) + i + 2
                 broken[i] = j
@@ -365,14 +391,15 @@ class smc:
         level = np.where(level != 0, level, np.nan)
         broken = np.where(broken != 0, broken, np.nan)
 
-        bos = pd.Series(bos, name="BOS")
-        choch = pd.Series(choch, name="CHOCH")
-        level = pd.Series(level, name="Level")
-        broken = pd.Series(broken, name="BrokenIndex")
+        bos = pd.Series(bos, name="BOS", index=ohlc.index)
+        choch = pd.Series(choch, name="CHOCH", index=ohlc.index)
+        level = pd.Series(level, name="Level", index=ohlc.index)
+        broken = pd.Series(broken, name="BrokenIndex", index=ohlc.index)
 
         return pd.concat([bos, choch, level, broken], axis=1)
 
     @classmethod
+    @inputvalidator(input_="ohlcv")
     def ob(
         cls,
         ohlc: DataFrame,
@@ -547,15 +574,18 @@ class smc:
         top_arr = np.where(~np.isnan(ob), top_arr, np.nan)
         bottom_arr = np.where(~np.isnan(ob), bottom_arr, np.nan)
         obVolume = np.where(~np.isnan(ob), obVolume, np.nan)
+        mitigated_index = np.where(mitigated_index != 0, mitigated_index, np.nan)
         mitigated_index = np.where(~np.isnan(ob), mitigated_index, np.nan)
         percentage = np.where(~np.isnan(ob), percentage, np.nan)
 
-        ob_series = pd.Series(ob, name="OB")
-        top_series = pd.Series(top_arr, name="Top")
-        bottom_series = pd.Series(bottom_arr, name="Bottom")
-        obVolume_series = pd.Series(obVolume, name="OBVolume")
-        mitigated_index_series = pd.Series(mitigated_index, name="MitigatedIndex")
-        percentage_series = pd.Series(percentage, name="Percentage")
+        ob_series = pd.Series(ob, name="OB", index=ohlc.index)
+        top_series = pd.Series(top_arr, name="Top", index=ohlc.index)
+        bottom_series = pd.Series(bottom_arr, name="Bottom", index=ohlc.index)
+        obVolume_series = pd.Series(obVolume, name="OBVolume", index=ohlc.index)
+        mitigated_index_series = pd.Series(
+            mitigated_index, name="MitigatedIndex", index=ohlc.index
+        )
+        percentage_series = pd.Series(percentage, name="Percentage", index=ohlc.index)
 
         return pd.concat(
             [
@@ -690,10 +720,10 @@ class smc:
                 liquidity_swept[i] = swept
 
         # Convert arrays to Series with the proper names.
-        liq_series = pd.Series(liquidity, name="Liquidity")
-        level_series = pd.Series(liquidity_level, name="Level")
-        end_series = pd.Series(liquidity_end, name="End")
-        swept_series = pd.Series(liquidity_swept, name="Swept")
+        liq_series = pd.Series(liquidity, name="Liquidity", index=ohlc.index)
+        level_series = pd.Series(liquidity_level, name="Level", index=ohlc.index)
+        end_series = pd.Series(liquidity_end, name="End", index=ohlc.index)
+        swept_series = pd.Series(liquidity_swept, name="Swept", index=ohlc.index)
 
         return pd.concat([liq_series, level_series, end_series, swept_series], axis=1)
 
@@ -728,10 +758,22 @@ class smc:
         # Edge case: not enough resampled periods
         if len(resampled) < 2:
             return pd.concat([
-                pd.Series(np.full(n, np.nan, dtype=np.float32), name="PreviousHigh"),
-                pd.Series(np.full(n, np.nan, dtype=np.float32), name="PreviousLow"),
-                pd.Series(np.zeros(n, dtype=np.int32), name="BrokenHigh"),
-                pd.Series(np.zeros(n, dtype=np.int32), name="BrokenLow"),
+                pd.Series(
+                    np.full(n, np.nan, dtype=np.float32),
+                    name="PreviousHigh",
+                    index=ohlc.index,
+                ),
+                pd.Series(
+                    np.full(n, np.nan, dtype=np.float32),
+                    name="PreviousLow",
+                    index=ohlc.index,
+                ),
+                pd.Series(
+                    np.zeros(n, dtype=np.int32), name="BrokenHigh", index=ohlc.index
+                ),
+                pd.Series(
+                    np.zeros(n, dtype=np.int32), name="BrokenLow", index=ohlc.index
+                ),
             ], axis=1)
 
         resampled_times = resampled.index.values
@@ -739,15 +781,17 @@ class smc:
         resampled_lows = resampled["low"].values
         candle_times = ohlc.index.values
 
-        # For each candle, find how many resampled periods have start time < candle time
-        # This is equivalent to: len(np.where(resampled_times < candle_time)[0])
-        periods_before = np.searchsorted(resampled_times, candle_times, side='left')
+        # For each candle, count how many resampled periods have already started
+        # (side='right' so a candle sitting exactly on a period boundary counts
+        # its own period, otherwise the first candle of every period looked up
+        # the period before the previous one).
+        periods_started = np.searchsorted(resampled_times, candle_times, side='right')
 
-        # Original takes second-to-last: indices[-2] = periods_before - 2
-        prev_period_idx = periods_before - 2
+        # The candle's own period is periods_started - 1, so the previous one is -2
+        prev_period_idx = periods_started - 2
 
-        # Valid only if more than 1 period before (original: len > 1, i.e., >= 2 periods)
-        valid_mask = periods_before > 1
+        # Valid only once a previous period exists
+        valid_mask = periods_started > 1
 
         # Initialize output arrays
         previous_high = np.full(n, np.nan, dtype=np.float32)
@@ -783,10 +827,10 @@ class smc:
         broken_low = np.where(valid_mask & (cummin_low < previous_low), 1, 0).astype(np.int32)
 
         return pd.concat([
-            pd.Series(previous_high, name="PreviousHigh"),
-            pd.Series(previous_low, name="PreviousLow"),
-            pd.Series(broken_high, name="BrokenHigh"),
-            pd.Series(broken_low, name="BrokenLow"),
+            pd.Series(previous_high, name="PreviousHigh", index=ohlc.index),
+            pd.Series(previous_low, name="PreviousLow", index=ohlc.index),
+            pd.Series(broken_high, name="BrokenHigh", index=ohlc.index),
+            pd.Series(broken_low, name="BrokenLow", index=ohlc.index),
         ], axis=1)
     
     @classmethod
@@ -797,6 +841,7 @@ class smc:
         start_time: str = "",
         end_time: str = "",
         time_zone: str = "UTC",
+        session_time_zone: str = "UTC",
     ) -> Series:
         """
         Sessions
@@ -806,12 +851,19 @@ class smc:
         session: str - the session you want to check (Sydney, Tokyo, London, New York, Asian kill zone, London open kill zone, New York kill zone, london close kill zone, Custom)
         start_time: str - the start time of the session in the format "HH:MM" only required for custom session.
         end_time: str - the end time of the session in the format "HH:MM" only required for custom session.
-        time_zone: str - the time zone of the candles can be in the format "UTC+0" or "GMT+0"
+        time_zone: str - the time zone the candles are labelled in, either a
+            fixed offset such as "UTC+5" / "GMT-3" or an IANA name such as
+            "America/New_York". Ignored when the index is already tz-aware.
+        session_time_zone: str - the time zone the session start and end times
+            are expressed in. Defaults to "UTC", which is how the built-in
+            sessions are defined. Pass an IANA name such as "America/New_York"
+            to have the window follow that region's daylight saving shifts
+            instead of drifting by an hour twice a year.
 
         returns:
         Active = 1 if the candle is within the session, 0 if not
-        High = the highest point of the session
-        Low = the lowest point of the session
+        High = the highest point of the session, NaN outside the session
+        Low = the lowest point of the session, NaN outside the session
         """
 
         if session == "Custom" and (start_time == "" or end_time == ""):
@@ -856,11 +908,18 @@ class smc:
             },
         }
 
-        ohlc.index = pd.to_datetime(ohlc.index)
-        if time_zone != "UTC":
-            time_zone = time_zone.replace("GMT", "Etc/GMT")
-            time_zone = time_zone.replace("UTC", "Etc/GMT")
-            ohlc.index = ohlc.index.tz_localize(time_zone).tz_convert("UTC")
+        original_index = ohlc.index
+        candle_times = pd.to_datetime(original_index)
+        if candle_times.tz is not None:
+            # the index already knows its offset, so time_zone is redundant
+            candle_times = candle_times.tz_convert("UTC")
+        else:
+            candle_times = candle_times.tz_localize(_resolve_time_zone(time_zone))
+            candle_times = candle_times.tz_convert("UTC")
+
+        # compare against the wall clock of whichever zone the session times are
+        # written in, so a named zone carries its own daylight saving shifts
+        candle_times = candle_times.tz_convert(_resolve_time_zone(session_time_zone))
 
         start_time = datetime.strptime(
             default_sessions[session]["start"], "%H:%M"
@@ -876,8 +935,10 @@ class smc:
         high = np.zeros(len(ohlc), dtype=np.float32)
         low = np.zeros(len(ohlc), dtype=np.float32)
 
+        _high = ohlc["high"].values
+        _low = ohlc["low"].values
         for i in range(len(ohlc)):
-            current_time = ohlc.index[i].strftime("%H:%M")
+            current_time = candle_times[i].strftime("%H:%M")
             # convert current time to the second of the day
             current_time = datetime.strptime(current_time, "%H:%M")
             if (start_time < end_time and start_time <= current_time <= end_time) or (
@@ -885,15 +946,19 @@ class smc:
                 and (start_time <= current_time or current_time <= end_time)
             ):
                 active[i] = 1
-                high[i] = max(ohlc["high"].iloc[i], high[i - 1] if i > 0 else 0)
+                high[i] = max(_high[i], high[i - 1] if i > 0 else 0)
                 low[i] = min(
-                    ohlc["low"].iloc[i],
+                    _low[i],
                     low[i - 1] if i > 0 and low[i - 1] != 0 else float("inf"),
                 )
 
-        active = pd.Series(active, name="Active")
-        high = pd.Series(high, name="High")
-        low = pd.Series(low, name="Low")
+        # 0 is a real price, so mark the candles outside the session as NaN
+        high = np.where(active == 1, high, np.nan)
+        low = np.where(active == 1, low, np.nan)
+
+        active = pd.Series(active, name="Active", index=original_index)
+        high = pd.Series(high, name="High", index=original_index)
+        low = pd.Series(low, name="Low", index=original_index)
 
         return pd.concat([active, high, low], axis=1)
 
@@ -912,7 +977,10 @@ class smc:
         DeepestRetracement% = the deepest retracement percentage from the swing high or low
         """
 
-        swing_highs_lows = swing_highs_lows.copy()
+        swing_hl = swing_highs_lows["HighLow"].values
+        swing_level = swing_highs_lows["Level"].values
+        _high = ohlc["high"].values
+        _low = ohlc["low"].values
 
         direction = np.zeros(len(ohlc), dtype=np.int32)
         current_retracement = np.zeros(len(ohlc), dtype=np.float64)
@@ -921,13 +989,13 @@ class smc:
         top = 0
         bottom = 0
         for i in range(len(ohlc)):
-            if swing_highs_lows["HighLow"][i] == 1:
+            if swing_hl[i] == 1:
                 direction[i] = 1
-                top = swing_highs_lows["Level"][i]
+                top = swing_level[i]
                 # deepest_retracement[i] = 0
-            elif swing_highs_lows["HighLow"][i] == -1:
+            elif swing_hl[i] == -1:
                 direction[i] = -1
-                bottom = swing_highs_lows["Level"][i]
+                bottom = swing_level[i]
                 # deepest_retracement[i] = 0
             else:
                 direction[i] = direction[i - 1] if i > 0 else 0
@@ -935,7 +1003,7 @@ class smc:
             if direction[i - 1] == 1:
                 divisor = top - bottom
                 current_retracement[i] = round(
-                    100 - (((ohlc["low"].iloc[i] - bottom) / divisor) * 100) if divisor != 0 else 0, 1
+                    100 - (((_low[i] - bottom) / divisor) * 100) if divisor != 0 else 0, 1
                 )
                 deepest_retracement[i] = max(
                     (
@@ -948,7 +1016,7 @@ class smc:
             if direction[i] == -1:
                 divisor = bottom - top
                 current_retracement[i] = round(
-                    100 - ((ohlc["high"].iloc[i] - top) / divisor) * 100 if divisor != 0 else 0, 1
+                    100 - ((_high[i] - top) / divisor) * 100 if divisor != 0 else 0, 1
                 )
                 deepest_retracement[i] = max(
                     (
@@ -980,8 +1048,12 @@ class smc:
                 deepest_retracement[i + 1] = 0
                 break
 
-        direction = pd.Series(direction, name="Direction")
-        current_retracement = pd.Series(current_retracement, name="CurrentRetracement%")
-        deepest_retracement = pd.Series(deepest_retracement, name="DeepestRetracement%")
+        direction = pd.Series(direction, name="Direction", index=ohlc.index)
+        current_retracement = pd.Series(
+            current_retracement, name="CurrentRetracement%", index=ohlc.index
+        )
+        deepest_retracement = pd.Series(
+            deepest_retracement, name="DeepestRetracement%", index=ohlc.index
+        )
 
         return pd.concat([direction, current_retracement, deepest_retracement], axis=1)

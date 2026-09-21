@@ -27,6 +27,12 @@ Prepare data to use with smc:
 
 smc expects properly formated ohlc DataFrame, with column names in lowercase: ["open", "high", "low", "close"] and ["volume"] for indicators that expect ohlcv input.
 
+Every indicator returns a DataFrame aligned to the index of the frame you passed in, so the results can be joined straight onto your data:
+
+```python
+ohlc = ohlc.join(smc.fvg(ohlc))
+```
+
 ## Indicators
 
 ### Fair Value Gap (FVG)
@@ -45,7 +51,7 @@ returns:<br>
 FVG = 1 if bullish fair value gap, -1 if bearish fair value gap<br>
 Top = the top of the fair value gap<br>
 Bottom = the bottom of the fair value gap<br>
-MitigatedIndex = the index of the candle that mitigated the fair value gap<br>
+MitigatedIndex = the index of the candle that mitigated the fair value gap, NaN if it has not been mitigated<br>
 
 ### Swing Highs and Lows
 
@@ -98,7 +104,10 @@ OB = 1 if bullish order block, -1 if bearish order block<br>
 Top = top of the order block<br>
 Bottom = bottom of the order block<br>
 OBVolume = volume + 2 last volumes amounts<br>
+MitigatedIndex = the index of the candle that mitigated the order block, NaN if it has not been mitigated<br>
 Percentage = strength of order block (min(highVolume, lowVolume)/max(highVolume,lowVolume))<br>
+
+This indicator needs a "volume" column in addition to ohlc.<br>
 
 
 ### Liquidity
@@ -140,7 +149,7 @@ BrokenLow = 1 once price has broken the previous low of the timeframe, 0 otherwi
 ### Sessions
 
 ```python
-smc.sessions(ohlc, session, start_time, end_time, time_zone = "UTC")
+smc.sessions(ohlc, session, start_time, end_time, time_zone = "UTC", session_time_zone = "UTC")
 ```
 
 This method returns which candles are within the session specified
@@ -149,12 +158,13 @@ parameters:<br>
 session: str - the session you want to check (Sydney, Tokyo, London, New York, Asian kill zone, London open kill zone, New York kill zone, london close kill zone, Custom)<br>
 start_time: str - the start time of the session in the format "HH:MM" only required for custom session.<br>
 end_time: str - the end time of the session in the format "HH:MM" only required for custom session.<br>
-time_zone: str - the time zone of the candles can be in the format "UTC+0" or "GMT+0"<br>
+time_zone: str - the time zone the candles are labelled in, either a fixed offset such as "UTC+5" / "GMT-3" or an IANA name such as "America/New_York". Ignored when the index is already tz-aware.<br>
+session_time_zone: str - the time zone the session start and end times are expressed in. Defaults to "UTC", which is how the built-in sessions are defined. Pass an IANA name such as "America/New_York" so the window follows that region's daylight saving shifts instead of drifting by an hour twice a year.<br>
 
 returns:<br>
 Active = 1 if the candle is within the session, 0 if not<br>
-High = the highest point of the session<br>
-Low = the lowest point of the session<br>
+High = the highest point of the session so far, NaN outside the session<br>
+Low = the lowest point of the session so far, NaN outside the session<br>
 
 ### Retracements
 
